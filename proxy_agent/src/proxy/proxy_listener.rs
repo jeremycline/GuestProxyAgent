@@ -23,109 +23,186 @@ use proxy_agent_shared::telemetry::event_logger;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-static SHUT_DOWN: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 static mut CONNECTION_COUNT: Lazy<Mutex<u128>> = Lazy::new(|| Mutex::new(0));
 static mut STATUS_MESSAGE: Lazy<String> =
     Lazy::new(|| String::from("Proxy listner has not started yet."));
 
-pub fn start_async(port: u16, pool_size: u16) {
-    _ = thread::Builder::new()
-        .name("proxy_listener".to_string())
-        .spawn(move || {
-            start(port, pool_size);
-        });
+#[derive(Clone, Debug)]
+pub enum ProxyRequest {
+    Status {
+        respond_to: mpsc::SyncSender<ProxyAgentDetailStatus>,
+    },
+    ConnectionCount {
+        respond_to: mpsc::SyncSender<u128>,
+    },
+    Join {
+        respond_to: mpsc::SyncSender<()>,
+    },
+    Stop,
 }
 
-fn start(port: u16, pool_size: u16) {
+#[derive(Clone, Debug)]
+pub struct ProxyHandle {
+    sender: mpsc::Sender<ProxyRequest>,
+    join_handle: Arc<Mutex<JoinHandle<()>>>,
+}
+
+impl ProxyHandle {
+    /// Create a new Proxy and acquire a handle to it.
+    pub fn new(port: u16, pool_size: u16) -> Self {
+        let (sender, receiver) = mpsc::channel();
+
+        let join_handle = thread::Builder::new()
+            .name("proxy_listener".to_string())
+            .spawn(move || {
+                start(receiver, port, pool_size);
+            })
+            .expect("Failed to spawn proxy thread");
+        let join_handle = Arc::new(Mutex::new(join_handle));
+
+        Self {
+            sender,
+            join_handle,
+        }
+    }
+
+    pub fn status(&self) -> ProxyAgentDetailStatus {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::Status { respond_to })
+            .expect("Failed to request status");
+        receiver.recv().unwrap()
+    }
+
+    pub fn connection_count(&self) -> u128 {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::ConnectionCount { respond_to })
+            .expect("Failed to request connection count");
+        receiver.recv().unwrap()
+    }
+
+    pub fn stop(&self) {
+        self.sender
+            .send(ProxyRequest::Stop)
+            .expect("Unable to stop proxy");
+    }
+
+    pub fn join(&self) {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::Join {respond_to})
+            .expect("Unable to join proxy");
+
+        let _ = receiver.recv();
+    }
+}
+
+fn start(receiver: mpsc::Receiver<ProxyRequest>, port: u16, pool_size: u16) {
     Connection::init_logger(config::get_logs_dir());
 
-    let shutdown = SHUT_DOWN.clone();
     // listen to wildcard ip address to accept request from
     // loopback address and local ip addresses
     let addr = format!("{}:{}", Ipv4Addr::UNSPECIFIED, port);
     logger::write(format!("Start proxy listener at '{}'.", &addr));
     let listener;
+    let mut status_message;
     match TcpListener::bind(&addr) {
         Ok(l) => listener = l,
         Err(e) => {
-            let message = format!("Failed to bind TcpListener '{}' with error {}.", addr, e);
-            unsafe {
-                *STATUS_MESSAGE = message.to_string();
-            }
-            logger::write_error(message);
+            status_message = format!("Failed to bind TcpListener '{}' with error {}.", addr, e);
+            logger::write_error(status_message.clone());
             return;
         }
     }
 
-    let message = helpers::write_startup_event(
+    status_message = helpers::write_startup_event(
         "Started proxy listener, ready to accept request",
         "start",
         "proxy_listener",
         logger::AGENT_LOGGER_KEY,
     );
-    unsafe {
-        *STATUS_MESSAGE = message.to_string();
-    }
     provision::listener_started();
 
+    let connection_count = Arc::new(Mutex::new(0));
     let pool = ProxyPool::new(pool_size as usize);
+    let mut join_requests = vec![];
 
-    for connection in listener.incoming() {
-        if shutdown.load(Ordering::Relaxed) {
-            let message = "Stop signal received, stop the listener.";
-            unsafe {
-                *STATUS_MESSAGE = message.to_string();
-            }
-            logger::write_warning(message.to_string());
-            break;
-        }
-        let mut connection_count_clone: u128 = 0;
-
-        if let Ok(mut connection_count_lock) = unsafe { CONNECTION_COUNT.lock() } {
-            if *connection_count_lock == u128::MAX {
-                // reset connection id
-                *connection_count_lock = 0;
-            }
-            *connection_count_lock += 1;
-
-            connection_count_clone = connection_count_lock.clone();
-        }
-        match connection {
-            Ok(stream) => {
-                pool.execute(move || {
-                    let mut connection = Connection {
-                        stream,
-                        id: connection_count_clone,
-                        now: Instant::now(),
-                        cliams: None,
-                        ip: String::new(),
-                        port: 0,
+    'proxy_loop: loop {
+        // First, process any pending requests for status and/or to stop
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                ProxyRequest::Status { respond_to } => {
+                    let status = ProxyAgentDetailStatus {
+                        status: ModuleState::RUNNING.to_string(),
+                        message: status_message.clone(),
+                        states: None,
                     };
-                    handle_connection(&mut connection);
-                });
+                    // There's nothing we can do if the requester is gone
+                    let _ = respond_to.send(status);
+                }
+                ProxyRequest::Stop => {
+                    status_message = "Stop signal received, stopping the listener.".to_string();
+                    logger::write_warning(status_message.clone());
+                    break 'proxy_loop;
+                }
+                ProxyRequest::Join { respond_to } => join_requests.push(respond_to),
+                ProxyRequest::ConnectionCount { respond_to } => {
+                    let _ = respond_to.send(*connection_count.lock().unwrap());
+                }
             }
-            Err(e) => {
-                logger::write_warning(format!("Incoming connection with error {e}; ignore it."));
-                continue;
+        }
+
+        for connection in listener.incoming() {
+            let connection_count_clone =
+                if let Ok(mut connection_count_lock) = connection_count.lock() {
+                    if *connection_count_lock == u128::MAX {
+                        // reset connection id
+                        *connection_count_lock = 0;
+                    }
+                    *connection_count_lock += 1;
+
+                    *connection_count_lock
+                } else {
+                    0
+                };
+            match connection {
+                Ok(stream) => {
+                    pool.execute(move || {
+                        let mut connection = Connection {
+                            stream,
+                            id: connection_count_clone,
+                            now: Instant::now(),
+                            cliams: None,
+                            ip: String::new(),
+                            port: 0,
+                        };
+                        handle_connection(&mut connection);
+                    });
+                }
+                Err(e) => {
+                    logger::write_warning(format!(
+                        "Incoming connection with error {e}; ignore it."
+                    ));
+                    continue;
+                }
             }
         }
     }
 
+    join_requests.into_iter().map(|tx| tx.send(()));
     logger::write("ProxyListener stopped accepting new request.".to_string());
 }
 
-pub fn get_proxy_connection_count() -> u128 {
-    unsafe { *CONNECTION_COUNT.lock().unwrap() }
-}
-
-pub fn stop(port: u16) {
-    SHUT_DOWN.store(true, Ordering::Relaxed);
+fn stop(port: u16) {
+    // SHUT_DOWN.store(true, Ordering::Relaxed);
     let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     logger::write_warning("Sending stop signal.".to_string());
 }
@@ -144,11 +221,17 @@ fn handle_connection(connection: &mut Connection) {
     match http::receive_request_data(&mut stream) {
         Ok(data) => request = data,
         Err(e) => {
-            Connection::write_warning(connection.id, format!("Failed to received data from client: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to received data from client: {}", e),
+            );
             return;
         }
     };
-    Connection::write_warning(connection.id, format!("Got request: {}", request.description()));
+    Connection::write_warning(
+        connection.id,
+        format!("Got request: {}", request.description()),
+    );
 
     // lookup the eBPF audit_map
     let client_source_ip: IpAddr;
@@ -157,14 +240,20 @@ fn handle_connection(connection: &mut Connection) {
         Ok(addr) => {
             client_source_port = addr.port();
             client_source_ip = addr.ip();
-            Connection::write(connection.id, format!(
-                "Got request from client - {}:{}",
-                client_source_ip.to_string(),
-                client_source_port
-            ));
+            Connection::write(
+                connection.id,
+                format!(
+                    "Got request from client - {}:{}",
+                    client_source_ip.to_string(),
+                    client_source_port
+                ),
+            );
         }
         Err(e) => {
-            Connection::write_warning(connection.id, format!("Failed to get client_source_port: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to get client_source_port: {}", e),
+            );
             return;
         }
     };
@@ -181,7 +270,10 @@ fn handle_connection(connection: &mut Connection) {
                 Connection::CONNECTION_LOGGER_KEY,
             );
 
-            Connection::write_information(connection.id, "Try to get audit entry from socket stream".to_string());
+            Connection::write_information(
+                connection.id,
+                "Try to get audit entry from socket stream".to_string(),
+            );
             match redirector::get_audit_from_stream(&stream) {
                 Ok(data) => entry = data,
                 Err(e) => {
@@ -207,7 +299,10 @@ fn handle_connection(connection: &mut Connection) {
     match serde_json::to_string(&claims) {
         Ok(json) => claim_details = json,
         Err(e) => {
-            Connection::write_warning(connection.id, format!("Failed to get claim json string: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to get claim json string: {}", e),
+            );
             send_response(&stream, Response::MISDIRECTED);
             log_connection_summary(connection, &request, Response::MISDIRECTED.to_string());
             return;
@@ -228,10 +323,10 @@ fn handle_connection(connection: &mut Connection) {
     let auth = proxy_authentication::get_authenticate(ip.to_string(), port, claims.clone());
     Connection::write(connection.id, format!("Got auth: {}", auth.to_string()));
     if !auth.authenticate(connection.id, request.url.to_string()) {
-        Connection::write_warning(connection.id, format!(
-            "Denied unauthorize request: {}",
-            claim_details.to_string()
-        ));
+        Connection::write_warning(
+            connection.id,
+            format!("Denied unauthorize request: {}", claim_details.to_string()),
+        );
         send_response(&stream, Response::FORBIDDEN);
         log_connection_summary(connection, &request, Response::FORBIDDEN.to_string());
         return;
@@ -242,7 +337,10 @@ fn handle_connection(connection: &mut Connection) {
     match http::connect_to_server(ip.to_string(), port, stream) {
         Ok(data) => server_stream = data,
         Err(e) => {
-            Connection::write_warning(connection.id, format!("Failed to start new request to host: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to start new request to host: {}", e),
+            );
             send_response(&stream, Response::MISDIRECTED);
             log_connection_summary(connection, &request, Response::MISDIRECTED.to_string());
             return;
@@ -289,14 +387,15 @@ fn handle_connection_with_signature(
         match helpers::compute_signature(key.to_string(), &input_to_sign.as_slice()) {
             Ok(sig) => {
                 match String::from_utf8(input_to_sign) {
-                    Ok(data) => {
-                        Connection::write(connection.id, format!("Computed the signature with input: {}", data))
-                    }
+                    Ok(data) => Connection::write(
+                        connection.id,
+                        format!("Computed the signature with input: {}", data),
+                    ),
                     Err(e) => {
-                        Connection::write_warning(connection.id, format!(
-                            "Failed convert the input_to_sign to string, error {}",
-                            e
-                        ));
+                        Connection::write_warning(
+                            connection.id,
+                            format!("Failed convert the input_to_sign to string, error {}", e),
+                        );
                     }
                 }
 
@@ -310,17 +409,26 @@ fn handle_connection_with_signature(
                     constants::AUTHORIZATION_HEADER.to_string(),
                     authorization_value.to_string(),
                 );
-                Connection::write(connection.id, format!(
-                    "Added authorization header {}",
-                    authorization_value.to_string()
-                ))
+                Connection::write(
+                    connection.id,
+                    format!(
+                        "Added authorization header {}",
+                        authorization_value.to_string()
+                    ),
+                )
             }
             Err(e) => {
-                Connection::write_error(connection.id, format!("compute_signature failed with error: {}", e));
+                Connection::write_error(
+                    connection.id,
+                    format!("compute_signature failed with error: {}", e),
+                );
             }
         }
     } else {
-        Connection::write(connection.id, "current key is empty, skip compute signature for testing.".to_string());
+        Connection::write(
+            connection.id,
+            "current key is empty, skip compute signature for testing.".to_string(),
+        );
     }
 
     // send to remote server
@@ -339,20 +447,29 @@ fn handle_connection_with_signature(
     ) {
         Ok(data) => {
             response_without_body = data.0;
-             Connection::write(connection.id, format!(
-                "Forwarded host response: {}, streamed body length: {}",
-                response_without_body.description(),
-                data.1
-            ));
+            Connection::write(
+                connection.id,
+                format!(
+                    "Forwarded host response: {}, streamed body length: {}",
+                    response_without_body.description(),
+                    data.1
+                ),
+            );
         }
         Err(e) => {
-            Connection::write_warning(connection.id, format!("Failed to forward response from host: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to forward response from host: {}", e),
+            );
             return;
         }
     };
 
     if response_without_body.is_continue_response() {
-        Connection::write(connection.id, "Current response expect sending original request body now.".to_string());
+        Connection::write(
+            connection.id,
+            "Current response expect sending original request body now.".to_string(),
+        );
         _ = server_stream.write_all(&request.get_body());
         _ = server_stream.flush();
 
@@ -363,14 +480,20 @@ fn handle_connection_with_signature(
         ) {
             Ok(data) => {
                 response_without_body = data.0;
-                 Connection::write(connection.id, format!(
-                    "Forwarded host response: {}, streamed body length: {}",
-                    response_without_body.description(),
-                    data.1
-                ));
+                Connection::write(
+                    connection.id,
+                    format!(
+                        "Forwarded host response: {}, streamed body length: {}",
+                        response_without_body.description(),
+                        data.1
+                    ),
+                );
             }
             Err(e) => {
-                 Connection::write_warning(connection.id, format!("Failed to forward response from host: {}", e));
+                Connection::write_warning(
+                    connection.id,
+                    format!("Failed to forward response from host: {}", e),
+                );
                 return;
             }
         };
@@ -395,7 +518,7 @@ fn handle_expect_continue_request(
     match request.headers.get_content_length() {
         Ok(len) => content_length = len,
         Err(e) => {
-             Connection::write_warning(connection.id, format!(" {}", e));
+            Connection::write_warning(connection.id, format!(" {}", e));
             send_response(client_stream, Response::BAD_REQUEST);
             log_connection_summary(connection, &request, Response::BAD_REQUEST.to_string());
             return;
@@ -407,7 +530,10 @@ fn handle_expect_continue_request(
     match http::receive_body(&client_stream, content_length) {
         Ok(d) => data = d,
         Err(e) => {
-             Connection::write_warning(connection.id, format!("Failed to received body from client: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to received body from client: {}", e),
+            );
             send_response(client_stream, Response::BAD_REQUEST);
             log_connection_summary(connection, &request, Response::BAD_REQUEST.to_string());
             return;
@@ -421,10 +547,13 @@ fn handle_connection_without_signature(
     mut request: Request,
     server_stream: &mut TcpStream,
 ) {
-     Connection::write_information(connection.id, format!(
-        "Current request {} could send to host without signature.",
-        request.description()
-    ));
+    Connection::write_information(
+        connection.id,
+        format!(
+            "Current request {} could send to host without signature.",
+            request.description()
+        ),
+    );
     let mut client_stream = &connection.stream;
 
     // send the request without signature to host
@@ -434,23 +563,26 @@ fn handle_connection_without_signature(
     match http::receive_response_data(server_stream) {
         Ok(data) => response = data,
         Err(e) => {
-             Connection::write_warning(connection.id, format!("Failed to receive data from host: {}", e));
+            Connection::write_warning(
+                connection.id,
+                format!("Failed to receive data from host: {}", e),
+            );
             send_response(&client_stream, Response::BAD_GATEWAY);
             log_connection_summary(connection, &request, Response::BAD_GATEWAY.to_string());
             return;
         }
     };
-     Connection::write(connection.id, format!(
-        "Received host response: {}",
-        response.description()
-    ));
+    Connection::write(
+        connection.id,
+        format!("Received host response: {}", response.description()),
+    );
 
     if response.is_continue_response() {
         let content_length;
         match request.headers.get_content_length() {
             Ok(len) => content_length = len,
             Err(e) => {
-                 Connection::write_warning(connection.id, format!(" {}", e));
+                Connection::write_warning(connection.id, format!(" {}", e));
                 send_response(&client_stream, Response::BAD_REQUEST);
                 log_connection_summary(connection, &request, Response::BAD_REQUEST.to_string());
                 return;
@@ -460,21 +592,30 @@ fn handle_connection_without_signature(
         // send 'continue' response to the original client
         send_response(&client_stream, Response::CONTINUE);
 
-        Connection::write(connection.id, "Current response expect streaming original body now.".to_string());
+        Connection::write(
+            connection.id,
+            "Current response expect streaming original body now.".to_string(),
+        );
         match http::stream_body(&mut client_stream, server_stream, content_length) {
             Ok(l) => {
                 if l < content_length {
-                     Connection::write_warning(connection.id, format!(
-                        "Streamed data {} from request body is less than Content-Length {}",
-                        l, content_length
-                    ));
+                    Connection::write_warning(
+                        connection.id,
+                        format!(
+                            "Streamed data {} from request body is less than Content-Length {}",
+                            l, content_length
+                        ),
+                    );
                     send_response(&client_stream, Response::BAD_REQUEST);
                     log_connection_summary(connection, &request, Response::BAD_REQUEST.to_string());
                     return;
                 }
             }
             Err(e) => {
-                 Connection::write_warning(connection.id, format!("Failed streaming the request body, error {}", e));
+                Connection::write_warning(
+                    connection.id,
+                    format!("Failed streaming the request body, error {}", e),
+                );
                 send_response(&client_stream, Response::BAD_GATEWAY);
                 log_connection_summary(connection, &request, Response::BAD_GATEWAY.to_string());
                 return;
@@ -484,16 +625,19 @@ fn handle_connection_without_signature(
         match http::receive_response_data(server_stream) {
             Ok(data) => response = data,
             Err(e) => {
-                 Connection::write_warning(connection.id, format!("Failed to receive data from host: {}", e));
+                Connection::write_warning(
+                    connection.id,
+                    format!("Failed to receive data from host: {}", e),
+                );
                 send_response(&client_stream, Response::BAD_GATEWAY);
                 log_connection_summary(connection, &request, Response::BAD_GATEWAY.to_string());
                 return;
             }
         };
-         Connection::write(connection.id, format!(
-            "Received host response: {}",
-            response.description()
-        ));
+        Connection::write(
+            connection.id,
+            format!("Received host response: {}", response.description()),
+        );
     }
 
     // insert default x-ms-azure-host-authorization header to let the client know it is through proxy agent
@@ -521,7 +665,7 @@ fn log_connection_summary(connection: &Connection, request: &Request, response_s
         userName: claims.userName.to_string(),
         userGroups: claims.userGroups.clone(),
         clientIp: claims.clientIp.to_string(),
-        processFullPath: claims.processFullPath.to_string(),        
+        processFullPath: claims.processFullPath.to_string(),
         processCmdLine: claims.processCmdLine.to_string(),
         runAsElevated: claims.runAsElevated,
         method: request.method.to_string(),
@@ -558,22 +702,6 @@ fn send_response(mut client_stream: &TcpStream, status: &str) {
     // response to original client
     _ = client_stream.write_all(response.to_raw_string().as_bytes());
     _ = client_stream.flush();
-}
-
-pub fn get_status() -> ProxyAgentDetailStatus {
-    let shutdown = SHUT_DOWN.clone();
-    let status;
-    if shutdown.load(Ordering::Relaxed) {
-        status = ModuleState::STOPPED.to_string();
-    } else {
-        status = ModuleState::RUNNING.to_string();
-    }
-
-    ProxyAgentDetailStatus {
-        status,
-        message: unsafe { STATUS_MESSAGE.to_string() },
-        states: None,
-    }
 }
 
 #[cfg(test)]
