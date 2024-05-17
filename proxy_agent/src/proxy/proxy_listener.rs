@@ -23,111 +23,182 @@ use proxy_agent_shared::telemetry::event_logger;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-static SHUT_DOWN: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 static mut CONNECTION_COUNT: Lazy<Mutex<u128>> = Lazy::new(|| Mutex::new(0));
 static mut STATUS_MESSAGE: Lazy<String> =
     Lazy::new(|| String::from("Proxy listner has not started yet."));
 
-pub fn start_async(port: u16, pool_size: u16) {
-    _ = thread::Builder::new()
-        .name("proxy_listener".to_string())
-        .spawn(move || {
-            start(port, pool_size);
-        });
+#[derive(Clone, Debug)]
+pub enum ProxyRequest {
+    Status {
+        respond_to: mpsc::SyncSender<ProxyAgentDetailStatus>,
+    },
+    ConnectionCount {
+        respond_to: mpsc::SyncSender<u128>,
+    },
+    Join {
+        respond_to: mpsc::SyncSender<()>,
+    },
+    Stop,
 }
 
-fn start(port: u16, pool_size: u16) {
+#[derive(Clone, Debug)]
+pub struct ProxyHandle {
+    sender: mpsc::Sender<ProxyRequest>,
+    join_handle: Arc<Mutex<JoinHandle<()>>>,
+}
+
+impl ProxyHandle {
+    /// Create a new Proxy and acquire a handle to it.
+    pub fn new(port: u16, pool_size: u16) -> Self {
+        let (sender, receiver) = mpsc::channel();
+
+        let join_handle = thread::Builder::new()
+            .name("proxy_listener".to_string())
+            .spawn(move || {
+                start(receiver, port, pool_size);
+            })
+            .expect("Failed to spawn proxy thread");
+        let join_handle = Arc::new(Mutex::new(join_handle));
+
+        Self {
+            sender,
+            join_handle,
+        }
+    }
+
+    pub fn status(&self) -> ProxyAgentDetailStatus {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::Status { respond_to })
+            .expect("Failed to request status");
+        receiver.recv().unwrap()
+    }
+
+    pub fn connection_count(&self) -> u128 {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::ConnectionCount { respond_to })
+            .expect("Failed to request connection count");
+        receiver.recv().unwrap()
+    }
+
+    pub fn stop(&self) {
+        self.sender
+            .send(ProxyRequest::Stop)
+            .expect("Unable to stop proxy");
+    }
+
+    pub fn join(&self) {
+        let (respond_to, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(ProxyRequest::Join { respond_to })
+            .expect("Unable to join proxy");
+
+        let _ = receiver.recv();
+    }
+}
+
+fn start(receiver: mpsc::Receiver<ProxyRequest>, port: u16, pool_size: u16) {
     Connection::init_logger(config::get_logs_dir());
 
-    let shutdown = SHUT_DOWN.clone();
     // listen to wildcard ip address to accept request from
     // loopback address and local ip addresses
     let addr = format!("{}:{}", Ipv4Addr::UNSPECIFIED, port);
     logger::write(format!("Start proxy listener at '{}'.", &addr));
     let listener;
+    let mut status_message;
     match TcpListener::bind(&addr) {
         Ok(l) => listener = l,
         Err(e) => {
-            let message = format!("Failed to bind TcpListener '{}' with error {}.", addr, e);
-            unsafe {
-                *STATUS_MESSAGE = message.to_string();
-            }
-            logger::write_error(message);
+            status_message = format!("Failed to bind TcpListener '{}' with error {}.", addr, e);
+            logger::write_error(status_message.clone());
             return;
         }
     }
 
-    let message = helpers::write_startup_event(
+    status_message = helpers::write_startup_event(
         "Started proxy listener, ready to accept request",
         "start",
         "proxy_listener",
         logger::AGENT_LOGGER_KEY,
     );
-    unsafe {
-        *STATUS_MESSAGE = message.to_string();
-    }
     provision::listener_started();
 
+    let connection_count = Arc::new(Mutex::new(0));
     let pool = ProxyPool::new(pool_size as usize);
+    let mut join_requests = vec![];
 
-    for connection in listener.incoming() {
-        if shutdown.load(Ordering::Relaxed) {
-            let message = "Stop signal received, stop the listener.";
-            unsafe {
-                *STATUS_MESSAGE = message.to_string();
-            }
-            logger::write_warning(message.to_string());
-            break;
-        }
-        let mut connection_count_clone: u128 = 0;
-
-        if let Ok(mut connection_count_lock) = unsafe { CONNECTION_COUNT.lock() } {
-            if *connection_count_lock == u128::MAX {
-                // reset connection id
-                *connection_count_lock = 0;
-            }
-            *connection_count_lock += 1;
-
-            connection_count_clone = connection_count_lock.clone();
-        }
-        match connection {
-            Ok(stream) => {
-                pool.execute(move || {
-                    let mut connection = Connection {
-                        stream,
-                        id: connection_count_clone,
-                        now: Instant::now(),
-                        cliams: None,
-                        ip: String::new(),
-                        port: 0,
+    'proxy_loop: loop {
+        // First, process any pending requests for status and/or to stop
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                ProxyRequest::Status { respond_to } => {
+                    let status = ProxyAgentDetailStatus {
+                        status: ModuleState::RUNNING.to_string(),
+                        message: status_message.clone(),
+                        states: None,
                     };
-                    handle_connection(&mut connection);
-                });
+                    // There's nothing we can do if the requester is gone
+                    let _ = respond_to.send(status);
+                }
+                ProxyRequest::Stop => {
+                    status_message = "Stop signal received, stopping the listener.".to_string();
+                    logger::write_warning(status_message.clone());
+                    break 'proxy_loop;
+                }
+                ProxyRequest::Join { respond_to } => join_requests.push(respond_to),
+                ProxyRequest::ConnectionCount { respond_to } => {
+                    let _ = respond_to.send(*connection_count.lock().unwrap());
+                }
             }
-            Err(e) => {
-                logger::write_warning(format!("Incoming connection with error {e}; ignore it."));
-                continue;
+        }
+
+        for connection in listener.incoming() {
+            let connection_count_clone =
+                if let Ok(mut connection_count_lock) = connection_count.lock() {
+                    if *connection_count_lock == u128::MAX {
+                        // reset connection id
+                        *connection_count_lock = 0;
+                    }
+                    *connection_count_lock += 1;
+
+                    *connection_count_lock
+                } else {
+                    0
+                };
+            match connection {
+                Ok(stream) => {
+                    pool.execute(move || {
+                        let mut connection = Connection {
+                            stream,
+                            id: connection_count_clone,
+                            now: Instant::now(),
+                            cliams: None,
+                            ip: String::new(),
+                            port: 0,
+                        };
+                        handle_connection(&mut connection);
+                    });
+                }
+                Err(e) => {
+                    logger::write_warning(format!(
+                        "Incoming connection with error {e}; ignore it."
+                    ));
+                    continue;
+                }
             }
         }
     }
 
+    join_requests.into_iter().map(|tx| tx.send(()));
     logger::write("ProxyListener stopped accepting new request.".to_string());
-}
-
-pub fn get_proxy_connection_count() -> u128 {
-    unsafe { *CONNECTION_COUNT.lock().unwrap() }
-}
-
-pub fn stop(port: u16) {
-    SHUT_DOWN.store(true, Ordering::Relaxed);
-    let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
-    logger::write_warning("Sending stop signal.".to_string());
 }
 
 fn handle_connection(connection: &mut Connection) {
@@ -627,22 +698,6 @@ fn send_response(mut client_stream: &TcpStream, status: &str) {
     _ = client_stream.flush();
 }
 
-pub fn get_status() -> ProxyAgentDetailStatus {
-    let shutdown = SHUT_DOWN.clone();
-    let status;
-    if shutdown.load(Ordering::Relaxed) {
-        status = ModuleState::STOPPED.to_string();
-    } else {
-        status = ModuleState::RUNNING.to_string();
-    }
-
-    ProxyAgentDetailStatus {
-        status,
-        message: unsafe { STATUS_MESSAGE.to_string() },
-        states: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::common::constants;
@@ -651,8 +706,8 @@ mod tests {
     use crate::common::http::request::Request;
     use crate::common::http::response::Response;
     use crate::common::logger;
-    use crate::proxy::proxy_listener;
     use crate::proxy::proxy_listener::Connection;
+    use crate::proxy::proxy_listener::ProxyHandle;
     use crate::proxy::Claims;
     use proxy_agent_shared::logger_manager;
     use std::env;
@@ -682,9 +737,7 @@ mod tests {
 
         // start listener, the port must different from the one used in production code
         let port: u16 = 8091;
-        let handle = thread::spawn(move || {
-            proxy_listener::start(port, 1);
-        });
+        let handle = ProxyHandle::new(port, 1);
 
         // give some time to let the listener started
         let sleep_duration = time::Duration::from_millis(100);
@@ -700,8 +753,8 @@ mod tests {
         let response = http::receive_response_data(&mut client).unwrap();
 
         // stop listener
-        proxy_listener::stop(port);
-        handle.join().unwrap();
+        handle.stop();
+        handle.join();
 
         assert_eq!(
             Response::MISDIRECTED,

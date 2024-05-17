@@ -10,12 +10,7 @@ use proxy_agent_shared::logger_manager;
 use proxy_agent_shared::telemetry::event_logger;
 use url::Url;
 
-#[cfg(not(windows))]
-use std::thread;
-#[cfg(not(windows))]
-use std::time::Duration;
-
-pub fn start_service() {
+pub fn start_service() -> proxy_listener::ProxyHandle {
     logger_manager::init_logger(
         logger::AGENT_LOGGER_KEY.to_string(),
         config::get_logs_dir(),
@@ -32,6 +27,10 @@ pub fn start_service() {
 
     let config_start_redirector = config::get_start_redirector();
 
+    // TODO: You would hand this handle off to the thing that wants to start/stop/get_status. It's cloneable
+    // and Send + Sync so it can be shared across thread.
+    let handle = proxy_listener::ProxyHandle::new(constants::PROXY_AGENT_PORT, 20);
+
     crate::key_keeper::poll_status_async(
         Url::parse(&format!("http://{}/", constants::WIRE_SERVER_IP)).unwrap(),
         config::get_keys_dir(),
@@ -39,27 +38,25 @@ pub fn start_service() {
         config_start_redirector,
     );
 
-    proxy_listener::start_async(constants::PROXY_AGENT_PORT, 20);
-
     // TODO:: need start the monitor thread and write proxy agent status to the file
     // monitor::start_async(config::get_monitor_duration());
+
+    handle
 }
 
 #[cfg(not(windows))]
 pub fn start_service_wait() {
-    start_service();
-
-    loop {
-        // continue to sleep until the service is stopped
-        thread::sleep(Duration::from_secs(1));
-    }
+    // TODO: introduce error handling
+    let handle = start_service();
+    handle.join();
 }
 
 pub fn stop_service() {
     crate::monitor::stop();
     crate::redirector::close(constants::PROXY_AGENT_PORT);
     crate::key_keeper::stop();
-    proxy_listener::stop(constants::PROXY_AGENT_PORT);
+    // TODO this function is used only by windows so we need to deal with threading handles around there.
+    // proxy_listener::stop(constants::PROXY_AGENT_PORT);
     event_logger::stop();
     event_reader::stop();
 }
